@@ -65,6 +65,24 @@ function Get-WorkingDayBefore {
 }
 
 ###############################################################################
+# SAFE SUBJECT FOR OUTLOOK RESTRICT
+###############################################################################
+
+function Sanitize-ForRestrict {
+    param([string]$text)
+
+    if (-not $text) { return "" }
+
+    # Remove characters that break Restrict()
+    $text = $text.Replace("'", "")
+    $text = $text.Replace('"', "")
+    $text = $text.Replace("`n"," ")
+    $text = $text.Replace("`r"," ")
+
+    return $text
+}
+
+###############################################################################
 # FIND OR CREATE CALENDARS IN LOCAL OUTLOOK PROFILE
 ###############################################################################
 
@@ -124,19 +142,36 @@ foreach ($row in $Data) {
 
     if ($row."Activar Embargo?" -eq "SI") {
 
+        # Extract date
         $rawDate = $row."embargo hasta"
 
-        if ($rawDate -is [datetime]) { $FechaEmbargo = $rawDate }
-        elseif ($rawDate -is [double]) { $FechaEmbargo = ([datetime]"1899-12-30").AddDays($rawDate) }
+        # Detect invalid inputs
+        if ($rawDate -match "TBD|-|#N|error") {
+            Write-Host "⚠ Skipped (invalid embargo date): $($row.Material)" -ForegroundColor Yellow
+            continue
+        }
+
+        # Convert
+        if     ($rawDate -is [datetime]) { $FechaEmbargo = $rawDate }
+        elseif ($rawDate -is [double])   { $FechaEmbargo = ([datetime]"1899-12-30").AddDays($rawDate) }
         else {
             try { $FechaEmbargo = [datetime]$rawDate }
-            catch { Write-Host "❌ Invalid embargo date: $rawDate" -ForegroundColor Red; continue }
+            catch { Write-Host "⚠ Skipped (invalid embargo date): $rawDate" -ForegroundColor Yellow; continue }
         }
 
         $FechaRecordatorio = Get-WorkingDayBefore -Fecha $FechaEmbargo -Festivos $Festivos
 
         $Titulo = "FIN EMBARGO - $($row.'Texto breve de material') - $($row.Material) - $($FechaEmbargo.ToString('dd/MM/yyyy'))"
+        $safeTitulo = Sanitize-ForRestrict $Titulo
 
+        # Duplicate check (safe)
+        $existing = $CalendarEmbargos.Items.Restrict("[Subject] = '$safeTitulo'")
+        if ($existing.Count -gt 0) {
+            Write-Host "⚠ Already exists (SKIPPED): $Titulo" -ForegroundColor Yellow
+            continue
+        }
+
+        # Create event
         $Appt = $CalendarEmbargos.Items.Add("IPM.Appointment")
         $Appt.Subject = $Titulo
         $Appt.Start = $FechaRecordatorio.Date
@@ -144,7 +179,7 @@ foreach ($row in $Data) {
         $Appt.Body = "Recordatorio de fin de embargo para material $($row.Material)"
         $Appt.Save()
 
-        Write-Host "✔ EMBARGO: $Titulo → $FechaRecordatorio" -ForegroundColor Green
+        Write-Host "✔ EMBARGO CREATED: $Titulo → $FechaRecordatorio" -ForegroundColor Green
     }
 
     ###############################################################################
@@ -155,15 +190,31 @@ foreach ($row in $Data) {
 
         $rawFechaVenta = $row."Venta al público desde"
 
-        if ($rawFechaVenta -is [datetime]) { $FechaVenta = $rawFechaVenta }
-        elseif ($rawFechaVenta -is [double]) { $FechaVenta = ([datetime]"1899-12-30").AddDays($rawFechaVenta) }
+        # Detect invalid inputs
+        if ($rawFechaVenta -match "TBD|-|#N|error") {
+            Write-Host "⚠ Skipped (invalid venta date): $($row.Material)" -ForegroundColor Yellow
+            continue
+        }
+
+        # Convert
+        if     ($rawFechaVenta -is [datetime]) { $FechaVenta = $rawFechaVenta }
+        elseif ($rawFechaVenta -is [double])   { $FechaVenta = ([datetime]"1899-12-30").AddDays($rawFechaVenta) }
         else {
             try { $FechaVenta = [datetime]$rawFechaVenta }
-            catch { Write-Host "❌ Invalid venta date: $rawFechaVenta" -ForegroundColor Red; continue }
+            catch { Write-Host "⚠ Skipped (invalid venta date): $rawFechaVenta" -ForegroundColor Yellow; continue }
         }
 
         $TituloVenta = "FIN VENTA AL PÚBLICO - $($row.'Texto breve de material') - $($row.Material) - $($FechaVenta.ToString('dd/MM/yyyy'))"
+        $safeTituloVenta = Sanitize-ForRestrict $TituloVenta
 
+        # Duplicate check
+        $existingVenta = $CalendarVenta.Items.Restrict("[Subject] = '$safeTituloVenta'")
+        if ($existingVenta.Count -gt 0) {
+            Write-Host "⚠ Already exists (SKIPPED): $TituloVenta" -ForegroundColor Yellow
+            continue
+        }
+
+        # Create event
         $ApptVenta = $CalendarVenta.Items.Add("IPM.Appointment")
         $ApptVenta.Subject = $TituloVenta
         $ApptVenta.Start = $FechaVenta.Date
@@ -171,7 +222,7 @@ foreach ($row in $Data) {
         $ApptVenta.Body = "Inicio de venta al público para material $($row.Material)"
         $ApptVenta.Save()
 
-        Write-Host "✔ VENTA: $TituloVenta → $FechaVenta" -ForegroundColor Green
+        Write-Host "✔ VENTA CREATED: $TituloVenta → $FechaVenta" -ForegroundColor Green
     }
 
 }
