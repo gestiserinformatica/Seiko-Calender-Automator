@@ -27,7 +27,7 @@ function Get-FestivosBarcelona {
 
     try {
         Write-Host "Downloading Barcelona holidays..." -ForegroundColor Cyan
-        
+
         $ics = Invoke-WebRequest -Uri $url -UseBasicParsing
         $lines = $ics.Content -split "`n"
 
@@ -83,35 +83,121 @@ function Sanitize-ForRestrict {
 }
 
 ###############################################################################
-# FIND OR CREATE CALENDARS IN LOCAL OUTLOOK PROFILE
+# OUTLOOK: USE MAILBOX seikoembargos@seiko.es (NO CREATION)
+# - Find mailbox root as it appears in Outlook profile
+# - Find calendars "Embargos Seiko" and "Venta al público" UNDER THAT MAILBOX
+# - If not found -> throw and DO NOT CREATE
 ###############################################################################
 
-function Find-OrCreateCalendar {
-    param([string]$CalendarName)
+function Normalize-Name {
+    param([string]$s)
 
-    $Outlook = New-Object -ComObject Outlook.Application
-    $Namespace = $Outlook.GetNamespace("MAPI")
+    if ([string]::IsNullOrWhiteSpace($s)) { return "" }
 
-    $MainCalendar = $Namespace.GetDefaultFolder(
-        [Microsoft.Office.Interop.Outlook.OlDefaultFolders]::olFolderCalendar
-    )
-
-    foreach ($folder in $MainCalendar.Folders) {
-        if ($folder.Name -eq $CalendarName) {
-            Write-Host "✔ Found calendar '$CalendarName'" -ForegroundColor Green
-            return $folder
+    $normalized = $s.Normalize([Text.NormalizationForm]::FormD)
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($ch in $normalized.ToCharArray()) {
+        $cat = [Globalization.CharUnicodeInfo]::GetUnicodeCategory($ch)
+        if ($cat -ne [Globalization.UnicodeCategory]::NonSpacingMark) {
+            [void]$sb.Append($ch)
         }
     }
 
-    Write-Host "⚠ Creating calendar '$CalendarName'..." -ForegroundColor Yellow
-    return $MainCalendar.Folders.Add(
-        $CalendarName,
-        [Microsoft.Office.Interop.Outlook.OlDefaultFolders]::olFolderCalendar
-    )
+    ($sb.ToString().ToLowerInvariant() -replace '\s+', ' ').Trim()
 }
 
-$CalendarEmbargos = Find-OrCreateCalendar -CalendarName "Embargos Seiko"
-$CalendarVenta    = Find-OrCreateCalendar -CalendarName "Venta al público"
+function Get-MailboxRootByName {
+    param(
+        [Parameter(Mandatory=$true)]$Namespace,
+        [Parameter(Mandatory=$true)][string]$MailboxName
+    )
+
+    $target = Normalize-Name $MailboxName
+
+    foreach ($f in $Namespace.Folders) {
+        try {
+            if ((Normalize-Name $f.Name) -eq $target) {
+                Write-Host "✔ Found mailbox root: $($f.Name)" -ForegroundColor Green
+                return $f
+            }
+        } catch {}
+    }
+
+    foreach ($st in $Namespace.Stores) {
+        try {
+            if ((Normalize-Name $st.DisplayName) -eq $target) {
+                $root = $st.GetRootFolder()
+                Write-Host "✔ Found mailbox root (Store): $($st.DisplayName)" -ForegroundColor Green
+                return $root
+            }
+        } catch {}
+    }
+
+    throw "Mailbox '$MailboxName' not found in Outlook profile. Make sure it is added."
+}
+
+function Find-CalendarFolderByNameUnderRoot {
+    param(
+        [Parameter(Mandatory=$true)]$RootFolder,
+        [Parameter(Mandatory=$true)][string]$CalendarName
+    )
+
+    $want = Normalize-Name $CalendarName
+
+    $queue = New-Object System.Collections.Queue
+    $queue.Enqueue($RootFolder)
+
+    while ($queue.Count -gt 0) {
+        $folder = $queue.Dequeue()
+
+        try {
+            # Calendar folders: DefaultItemType == 1 (olAppointmentItem)
+            if ($folder.DefaultItemType -eq 1) {
+                if ((Normalize-Name $folder.Name) -eq $want) {
+                    return $folder
+                }
+            }
+        } catch {}
+
+        try {
+            foreach ($sub in $folder.Folders) {
+                $queue.Enqueue($sub)
+            }
+        } catch {}
+    }
+
+    return $null
+}
+
+# One Outlook session (more reliable)
+$Outlook   = New-Object -ComObject Outlook.Application
+$Namespace = $Outlook.GetNamespace("MAPI")
+
+$TargetMailbox = "seikoembargos@seiko.es"
+$MailboxRoot = Get-MailboxRootByName -Namespace $Namespace -MailboxName $TargetMailbox
+
+$CalendarEmbargos = Find-CalendarFolderByNameUnderRoot -RootFolder $MailboxRoot -CalendarName "Embargos Seiko"
+if (-not $CalendarEmbargos) {
+    throw "Calendar 'Embargos Seiko' NOT found under mailbox '$TargetMailbox'. Nothing was created."
+}
+Write-Host "✔ Using calendar 'Embargos Seiko' | $($CalendarEmbargos.FolderPath)" -ForegroundColor Green
+
+# Your tree may show "Venta al Publico" (no accent) or "Venta al público"
+$CalendarVenta = Find-CalendarFolderByNameUnderRoot -RootFolder $MailboxRoot -CalendarName "Venta al público"
+if (-not $CalendarVenta) {
+    $CalendarVenta = Find-CalendarFolderByNameUnderRoot -RootFolder $MailboxRoot -CalendarName "Venta al Publico"
+}
+if (-not $CalendarVenta) {
+    throw "Calendar 'Venta al público' NOT found under mailbox '$TargetMailbox'. Nothing was created."
+}
+Write-Host "✔ Using calendar 'Venta al público' | $($CalendarVenta.FolderPath)" -ForegroundColor Green
+
+# Improve Items behavior for searching/recurrences
+$CalendarEmbargos.Items.IncludeRecurrences = $true
+$CalendarEmbargos.Items.Sort("[Start]")
+$CalendarVenta.Items.IncludeRecurrences = $true
+$CalendarVenta.Items.Sort("[Start]")
+
 
 ###############################################################################
 # READ EXCEL
@@ -126,6 +212,7 @@ Write-Host "Reading Excel with Import-Excel..." -ForegroundColor Cyan
 $Data = Import-Excel -Path $ExcelPath
 Write-Host "Excel loaded: $($Data.Count) rows" -ForegroundColor Green
 
+
 ###############################################################################
 # PROCESS ROWS & CREATE EVENTS
 ###############################################################################
@@ -139,19 +226,18 @@ foreach ($row in $Data) {
     ###############################################################################
     # EMBARGO EVENT
     ###############################################################################
-
     if ($row."Activar Embargo?" -eq "SI") {
 
         # Extract date
         $rawDate = $row."embargo hasta"
 
         # Detect invalid inputs
-        if ($rawDate -match "TBD|-|#N|error") {
-            Write-Host "⚠ Skipped (invalid embargo date): $($row.Material)" -ForegroundColor Yellow
+        if ($null -eq $rawDate -or ($rawDate.ToString() -match "TBD|-|#N|error")) {
+            Write-Host "⚠ Skipped (invalid embargo date): $($row.Material) -> $rawDate" -ForegroundColor Yellow
             continue
         }
 
-        # Convert
+        # Convert (keep your original conversion logic)
         if     ($rawDate -is [datetime]) { $FechaEmbargo = $rawDate }
         elseif ($rawDate -is [double])   { $FechaEmbargo = ([datetime]"1899-12-30").AddDays($rawDate) }
         else {
@@ -171,7 +257,7 @@ foreach ($row in $Data) {
             continue
         }
 
-        # Create event
+        # Create event in seikoembargos@seiko.es -> Embargos Seiko
         $Appt = $CalendarEmbargos.Items.Add("IPM.Appointment")
         $Appt.Subject = $Titulo
         $Appt.Start = $FechaRecordatorio.Date
@@ -179,24 +265,23 @@ foreach ($row in $Data) {
         $Appt.Body = "Recordatorio de fin de embargo para material $($row.Material)"
         $Appt.Save()
 
-        Write-Host "✔ EMBARGO CREATED: $Titulo → $FechaRecordatorio" -ForegroundColor Green
+        Write-Host "✔ EMBARGO CREATED (seikoembargos@seiko.es): $Titulo → $FechaRecordatorio" -ForegroundColor Green
     }
 
     ###############################################################################
     # VENTA AL PUBLICO EVENT
     ###############################################################################
-
     if ($row."Activar Venta al Publico?" -eq "SI") {
 
         $rawFechaVenta = $row."Venta al público desde"
 
         # Detect invalid inputs
-        if ($rawFechaVenta -match "TBD|-|#N|error") {
-            Write-Host "⚠ Skipped (invalid venta date): $($row.Material)" -ForegroundColor Yellow
+        if ($null -eq $rawFechaVenta -or ($rawFechaVenta.ToString() -match "TBD|-|#N|error")) {
+            Write-Host "⚠ Skipped (invalid venta date): $($row.Material) -> $rawFechaVenta" -ForegroundColor Yellow
             continue
         }
 
-        # Convert
+        # Convert (keep your original conversion logic)
         if     ($rawFechaVenta -is [datetime]) { $FechaVenta = $rawFechaVenta }
         elseif ($rawFechaVenta -is [double])   { $FechaVenta = ([datetime]"1899-12-30").AddDays($rawFechaVenta) }
         else {
@@ -214,7 +299,7 @@ foreach ($row in $Data) {
             continue
         }
 
-        # Create event
+        # Create event in seikoembargos@seiko.es -> Venta al público
         $ApptVenta = $CalendarVenta.Items.Add("IPM.Appointment")
         $ApptVenta.Subject = $TituloVenta
         $ApptVenta.Start = $FechaVenta.Date
@@ -222,7 +307,7 @@ foreach ($row in $Data) {
         $ApptVenta.Body = "Inicio de venta al público para material $($row.Material)"
         $ApptVenta.Save()
 
-        Write-Host "✔ VENTA CREATED: $TituloVenta → $FechaVenta" -ForegroundColor Green
+        Write-Host "✔ VENTA CREATED (seikoembargos@seiko.es): $TituloVenta → $FechaVenta" -ForegroundColor Green
     }
 
 }
@@ -238,6 +323,7 @@ Write-Host ""
 Write-Host "============================================" -ForegroundColor Cyan
 Write-Host "   FINAL SUMMARY" -ForegroundColor Cyan
 Write-Host "============================================"
+Write-Host "Mailbox used: $TargetMailbox" -ForegroundColor Green
 Write-Host "Total events in 'Embargos Seiko'     : $TotalEmbargos" -ForegroundColor Green
 Write-Host "Total events in 'Venta al público'   : $TotalVentas"   -ForegroundColor Green
 Write-Host "============================================" -ForegroundColor Cyan
